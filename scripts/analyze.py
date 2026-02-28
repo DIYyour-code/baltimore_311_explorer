@@ -92,6 +92,47 @@ def cluster_locations(df):
     return df
 
 
+def build_report_history(group):
+    """
+    Build a chronological list of individual reports for a cluster,
+    flagging which ones are re-reports after a closure (possible failed fixes).
+    Returns a list of dicts, one per report, sorted by date.
+    """
+    sorted_reports = group.sort_values('createddate').reset_index(drop=True)
+    history = []
+    last_closure_date = None
+
+    for _, row in sorted_reports.iterrows():
+        created = row.get('createddate')
+        status_date = row.get('statusdate')
+        status = row.get('srstatus', '') or ''
+        srtype = row.get('srtype', '') or ''
+        sr_num = row.get('servicerequestnum', '') or ''
+        resolution = row.get('resolution_days')
+
+        # Is this a re-report after a recent closure?
+        is_rereport = False
+        if last_closure_date is not None and pd.notna(created):
+            days_since_closure = (created - last_closure_date).days
+            if 0 < days_since_closure <= FAILED_FIX_WINDOW_DAYS:
+                is_rereport = True
+
+        history.append({
+            'date': created.strftime('%Y-%m-%d') if pd.notna(created) else None,
+            'status': status,
+            'srtype': srtype,
+            'sr_num': str(sr_num)[:20] if sr_num else None,
+            'resolution_days': int(resolution) if pd.notna(resolution) and resolution == resolution else None,
+            'is_rereport': is_rereport,
+        })
+
+        # Track most recent closure date
+        if 'closed' in status.lower() and pd.notna(status_date):
+            last_closure_date = status_date
+
+    return history
+
+
 def identify_chronic_hotspots(df):
     """
     Find locations with repeated reports over an extended time span.
@@ -153,6 +194,10 @@ def identify_chronic_hotspots(df):
             _street_mode = group['street'].dropna().mode()
             address_hint = _street_mode.iloc[0] if not _street_mode.empty else None
         
+        # Build per-report history for the timeline view
+        # Include all reports sorted by date, flagging re-reports after closures
+        history = build_report_history(group)
+
         hotspots.append({
             'cluster_id': int(cluster_id),
             'latitude': round(centroid_lat, 6),
@@ -169,6 +214,7 @@ def identify_chronic_hotspots(df):
             'possible_failed_fixes': possible_failed_fixes,
             'address_hint': address_hint,
             'is_high_priority': report_count >= HIGH_CHRONIC_THRESHOLD or possible_failed_fixes >= 2,
+            'history': history,
         })
     
     hotspots_df = pd.DataFrame(hotspots)
@@ -329,6 +375,87 @@ def gap_analysis(df_311, df_reddit):
     return gaps
 
 
+def category_fix_rates(df_311, hotspots_list):
+    """
+    For each broad request category, calculate:
+    - Total requests in the raw 311 data
+    - How many requests fall inside chronic hotspot clusters (repeated-report locations)
+    - Of those hotspot requests, how many are flagged as re-reports after a closure
+    - An overall "recurrence rate" = rereports / total requests in category
+
+    This answers: "Out of all pothole requests, what % appear to be failed fixes
+    at chronic locations?"
+    """
+    def categorize_type(srtype):
+        if not srtype:
+            return 'Other'
+        t = str(srtype).lower()
+        if 'pothole' in t: return 'Pothole'
+        if 'light' in t or 'streetlight' in t: return 'Street Light'
+        if 'alley' in t: return 'Alley'
+        if 'sidewalk' in t: return 'Sidewalk'
+        if 'water' in t or 'main' in t: return 'Water Main'
+        if 'cave' in t or 'sinkhole' in t: return 'Cave-In / Sinkhole'
+        if 'storm' in t or 'drain' in t or 'catch' in t: return 'Storm Drain'
+        if 'curb' in t or 'bridge' in t or 'street' in t: return 'Street / Curb'
+        return 'Other'
+
+    if df_311 is None or df_311.empty:
+        return {}
+
+    # Count raw requests per category across all data
+    if 'srtype' not in df_311.columns:
+        return {}
+
+    # Build a lookup: cluster_id -> (total_rereports, total_reports_in_cluster)
+    cluster_rereports = {}
+    cluster_total = {}
+    for h in hotspots_list:
+        cid = h.get('cluster_id')
+        if cid is None:
+            continue
+        history = h.get('history', [])
+        cluster_rereports[cid] = sum(1 for r in history if r.get('is_rereport'))
+        cluster_total[cid] = len(history)
+
+    # Map each 311 record to its category
+    df = df_311.copy()
+    df['_category'] = df['srtype'].apply(categorize_type)
+
+    stats = {}
+    for cat, group in df.groupby('_category'):
+        total = len(group)
+
+        # How many of these are in a chronic cluster? (unused directly, computed via hotspots below)
+        clustered_count = 0
+
+        # Sum rereports across all clusters of this category
+        # We do this by summing from hotspots whose primary_type maps to this category
+        cat_rereports = 0
+        cat_cluster_reports = 0
+        for h in hotspots_list:
+            if categorize_type(h.get('primary_type', '')) != cat:
+                continue
+            history = h.get('history', [])
+            cat_rereports += sum(1 for r in history if r.get('is_rereport'))
+            cat_cluster_reports += len(history)
+
+        recurrence_pct = round(cat_rereports / total * 100, 1) if total > 0 else 0
+        cluster_pct = round(cat_cluster_reports / total * 100, 1) if total > 0 else 0
+
+        stats[cat] = {
+            'total_requests': total,
+            'requests_at_chronic_locations': cat_cluster_reports,
+            'rereports': cat_rereports,
+            'recurrence_pct': recurrence_pct,   # % of all requests that are re-reports
+            'chronic_location_pct': cluster_pct, # % of requests at chronic spots
+        }
+
+    # Sort by recurrence_pct descending
+    stats = dict(sorted(stats.items(), key=lambda x: -x[1]['recurrence_pct']))
+    return stats
+
+
 def main():
     os.makedirs(DATA_DIR, exist_ok=True)
     
@@ -362,9 +489,20 @@ def main():
     print("Step 4/4: Running gap analysis...")
     gaps = gap_analysis(df_311, df_reddit)
     print(f"  Found {len(gaps):,} potential gap neighborhoods")
-    
+
     # Build output
     hotspots_list = hotspots_df.to_dict('records') if not hotspots_df.empty else []
+
+    # Step 5: Category fix rates
+    print("Step 5/5: Calculating category recurrence rates...")
+    cat_stats = category_fix_rates(df_311, hotspots_list)
+    print(f"  Processed {len(cat_stats)} categories")
+    if cat_stats:
+        print(f"  Category recurrence rates:")
+        for cat, s in cat_stats.items():
+            print(f"    {cat:<25} {s['total_requests']:>6,} requests  "
+                  f"{s['recurrence_pct']:>5.1f}% re-reports  "
+                  f"{s['rereports']:>5,} failed fixes")
     
     # Summary stats for the dashboard header
     summary_stats = {
@@ -385,6 +523,7 @@ def main():
         'hotspots': hotspots_list,
         'neighborhoods': neighborhoods,
         'gaps': gaps,
+        'category_stats': cat_stats,
     }
     
     with open(OUTPUT_PATH, 'w') as f:

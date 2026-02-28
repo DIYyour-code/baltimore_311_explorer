@@ -61,11 +61,13 @@ def make_hotspot_popup(hotspot):
     last_report = hotspot.get('last_report', '')[:10]
     avg_res = hotspot.get('avg_resolution_days')
     is_high = hotspot.get('is_high_priority', False)
-    
+    history = hotspot.get('history', [])
+    cluster_id = hotspot.get('cluster_id', 0)
+
     status_html = ''
     for status, count in hotspot.get('status_breakdown', {}).items():
         status_html += f'<div class="status-row"><span>{status}</span><span>{count}</span></div>'
-    
+
     failed_fix_html = ''
     if failed_fixes > 0:
         failed_fix_html = f'''
@@ -73,9 +75,33 @@ def make_hotspot_popup(hotspot):
             ⚠️ {failed_fixes} possible failed fix{"es" if failed_fixes > 1 else ""}
             <span class="failed-fix-note">Re-reported within 120 days of closure</span>
         </div>'''
-    
+
     priority_badge = '<span class="priority-badge">HIGH PRIORITY</span>' if is_high else ''
-    
+
+    # Build history timeline rows
+    history_rows = ''
+    for entry in history:
+        date = entry.get('date') or '—'
+        status = entry.get('status') or '—'
+        res = entry.get('resolution_days')
+        is_rereport = entry.get('is_rereport', False)
+
+        row_class = 'hist-rereport' if is_rereport else 'hist-normal'
+        rereport_badge = '<span class="rereport-badge">↩ re-report</span>' if is_rereport else ''
+        res_str = f'{res}d' if res is not None else '—'
+
+        status_class = ''
+        if 'closed' in status.lower() and 'duplicate' not in status.lower():
+            status_class = 'hist-status-closed'
+        elif 'open' in status.lower() or 'new' in status.lower():
+            status_class = 'hist-status-open'
+
+        history_rows += f'''<tr class="{row_class}">
+            <td class="hist-date">{date}</td>
+            <td class="hist-status {status_class}">{status} {rereport_badge}</td>
+            <td class="hist-res">{res_str}</td>
+        </tr>'''
+
     return f"""
     <div class="popup-card">
         <div class="popup-header">
@@ -98,7 +124,7 @@ def make_hotspot_popup(hotspot):
                 <div class="stat-label">severity score</div>
             </div>
         </div>
-        <div class="popup-timeline">
+        <div class="popup-timeline-range">
             <span>First: {first_report}</span>
             <span>→</span>
             <span>Last: {last_report}</span>
@@ -107,6 +133,19 @@ def make_hotspot_popup(hotspot):
         <div class="status-breakdown">
             <div class="status-heading">Status breakdown</div>
             {status_html}
+        </div>
+        <div class="history-section">
+            <button class="history-toggle" onclick="toggleHistory('hist-{cluster_id}', this)">
+                ▶ Show full history ({report_count} reports)
+            </button>
+            <div id="hist-{cluster_id}" class="history-table-wrap" style="display:none">
+                <table class="history-table">
+                    <thead><tr>
+                        <th>Date</th><th>Status</th><th>Resolved</th>
+                    </tr></thead>
+                    <tbody>{history_rows}</tbody>
+                </table>
+            </div>
         </div>
     </div>
     """
@@ -241,7 +280,14 @@ def build_sidebar_html(data):
     filter_section = f'''
     <div class="filter-section">
         <div class="filter-title">Filter by Type</div>
-        <div class="filter-chips">{filter_chips}</div>
+        <div class="filter-chips">
+            {filter_chips}
+            <div class="filter-chip failed-fix-chip" id="failed-fixes-toggle"
+                 style="--chip-color:#e74c3c"
+                 onclick="toggleFailedFixes()">
+                <div class="chip-dot"></div>⚠️ Failed fixes only
+            </div>
+        </div>
         <button id="clear-filters" onclick="clearFilters()">Clear filters</button>
     </div>
     '''
@@ -262,7 +308,7 @@ def build_sidebar_html(data):
         failed_html = f'<span class="failed-tag">⚠️ {failed} failed fix{"es" if failed > 1 else ""}</span>' if failed else ''
 
         hotspot_rows += f"""
-        <div class="hotspot-row" data-cat="{cat}" onclick="focusHotspot({h['latitude']}, {h['longitude']})">
+        <div class="hotspot-row" data-cat="{cat}" data-failed="{failed}" onclick="focusHotspot({h['latitude']}, {h['longitude']})">
             <div class="hotspot-dot" style="background:{cat_color}"></div>
             <div class="hotspot-info">
                 <div class="hotspot-addr">{addr[:35]}{'...' if len(addr) > 35 else ''}</div>
@@ -306,9 +352,38 @@ def build_sidebar_html(data):
             <div class="gap-name">{gap['neighborhood']}</div>
             <div class="gap-meta">Reddit signal: {gap['reddit_signal']} · 311 reports: {gap['311_reports']}</div>
         </div>"""
-    
+
     if not gap_rows:
         gap_rows = '<div class="no-data">Run fetch_reddit.py to enable gap analysis</div>'
+
+    # Category recurrence rate rows
+    cat_stats = data.get('category_stats', {})
+    cat_rows = ''
+    for cat, s in cat_stats.items():
+        total = s.get('total_requests', 0)
+        rereports = s.get('rereports', 0)
+        pct = s.get('recurrence_pct', 0)
+        color = CATEGORY_COLORS.get(cat, '#7f8c8d')
+
+        # Bar fill: scale 0-100% but visually cap at 80 so even high values fit
+        bar_pct = min(pct, 100)
+        # Color the bar red if high recurrence, amber if medium, green if low
+        bar_color = '#e74c3c' if pct >= 40 else '#e67e22' if pct >= 20 else '#2ecc71'
+
+        cat_rows += f"""
+        <div class="cat-row">
+            <div class="cat-header">
+                <div class="cat-dot" style="background:{color}"></div>
+                <div class="cat-name">{cat}</div>
+                <div class="cat-pct" style="color:{bar_color}">{pct}%</div>
+            </div>
+            <div class="cat-bar-wrap">
+                <div class="cat-bar" style="width:{bar_pct}%;background:{bar_color}"></div>
+            </div>
+            <div class="cat-detail">{total:,} requests · {rereports:,} apparent re-reports</div>
+        </div>"""
+    if not cat_rows:
+        cat_rows = '<div class="no-data">Re-run analyze.py to generate category stats</div>'
     
     date_range = ''
     if 'date_range' in summary:
@@ -358,6 +433,12 @@ def build_sidebar_html(data):
             {neighborhood_rows or '<div class="no-data">No neighborhood data</div>'}
         </div>
         
+        <div class="section">
+            <div class="section-title">Fix Effectiveness by Category</div>
+            <div class="section-subtitle">% of all requests that appear to be re-reports after a closure</div>
+            {cat_rows}
+        </div>
+
         <div class="section">
             <div class="section-title">Gap Analysis</div>
             <div class="section-subtitle">Social signal without 311 activity</div>
@@ -749,6 +830,136 @@ def inject_ui(map_html, sidebar_html):
             margin: 14px !important;
         }
 
+        /* History timeline */
+        .history-section { margin-top: 10px; border-top: 1px solid #ecf0f1; padding-top: 8px; }
+
+        .history-toggle {
+            background: #f0f4f8;
+            border: 1px solid #dde3ea;
+            border-radius: 4px;
+            padding: 5px 10px;
+            font-size: 12px;
+            color: #34495e;
+            cursor: pointer;
+            width: 100%;
+            text-align: left;
+            font-family: 'IBM Plex Sans', sans-serif;
+            transition: background 0.15s;
+        }
+        .history-toggle:hover { background: #e2eaf2; }
+        .history-toggle.open { background: #2c3e50; color: #fff; border-color: #2c3e50; }
+
+        .history-table-wrap {
+            margin-top: 8px;
+            max-height: 220px;
+            overflow-y: auto;
+            border: 1px solid #ecf0f1;
+            border-radius: 4px;
+        }
+
+        .history-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 11px;
+        }
+
+        .history-table thead tr {
+            background: #f5f7fa;
+            position: sticky;
+            top: 0;
+        }
+
+        .history-table th {
+            padding: 5px 6px;
+            text-align: left;
+            color: #7f8c8d;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            font-size: 10px;
+            border-bottom: 1px solid #ecf0f1;
+        }
+
+        .history-table td { padding: 4px 6px; border-bottom: 1px solid #f5f7fa; color: #34495e; }
+        .history-table tr:last-child td { border-bottom: none; }
+
+        .hist-rereport { background: #fff8f0 !important; }
+        .hist-rereport td { color: #c0392b !important; }
+
+        .rereport-badge {
+            background: #e74c3c;
+            color: white;
+            font-size: 9px;
+            padding: 1px 4px;
+            border-radius: 3px;
+            font-weight: 600;
+            white-space: nowrap;
+        }
+
+        .hist-status-closed { color: #27ae60 !important; font-weight: 500; }
+        .hist-status-open { color: #e67e22 !important; font-weight: 500; }
+        .hist-date { white-space: nowrap; color: #7f8c8d !important; }
+        .hist-res { white-space: nowrap; text-align: right; color: #95a5a6 !important; }
+
+        .popup-timeline-range {
+            display: flex;
+            gap: 6px;
+            font-size: 11px;
+            color: #7f8c8d;
+            margin-bottom: 6px;
+        }
+
+        /* Category fix rate rows */
+        .cat-row { padding: 8px 0; border-bottom: 1px solid #13171c; }
+        .cat-row:last-child { border-bottom: none; }
+
+        .cat-header {
+            display: flex;
+            align-items: center;
+            gap: 7px;
+            margin-bottom: 5px;
+        }
+
+        .cat-dot {
+            width: 8px; height: 8px;
+            border-radius: 50%;
+            flex-shrink: 0;
+        }
+
+        .cat-name {
+            flex: 1;
+            font-size: 12px;
+            color: #c0c8d0;
+            font-weight: 500;
+        }
+
+        .cat-pct {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 13px;
+            font-weight: 700;
+            min-width: 40px;
+            text-align: right;
+        }
+
+        .cat-bar-wrap {
+            height: 4px;
+            background: #1a1e24;
+            border-radius: 2px;
+            overflow: hidden;
+            margin-bottom: 4px;
+        }
+
+        .cat-bar {
+            height: 100%;
+            border-radius: 2px;
+            transition: width 0.4s ease;
+        }
+
+        .cat-detail {
+            font-size: 10px;
+            color: #3a4048;
+        }
+
         /* Filter chips */
         .filter-section {
             padding: 14px 18px;
@@ -879,7 +1090,7 @@ def inject_ui(map_html, sidebar_html):
             marker.bindTooltip(h.addr + ' — ' + h.count + ' reports', { sticky: true });
 
             marker.addTo(map);
-            _markers.push({ marker: marker, cat: h.cat, score: h.score, map: map });
+            _markers.push({ marker: marker, cat: h.cat, score: h.score, failed: h.failed || 0, map: map });
         });
 
         console.log('Built ' + _markers.length + ' markers');
@@ -929,9 +1140,12 @@ def inject_ui(map_html, sidebar_html):
 
     function clearFilters() {
         _activeFilters.clear();
+        _failedFixesOnly = false;
         document.querySelectorAll('.filter-chip').forEach(function(c) {
             c.classList.remove('active');
         });
+        var ffBtn = document.getElementById('failed-fixes-toggle');
+        if (ffBtn) ffBtn.textContent = '⚠️ Failed fixes only';
         document.getElementById('clear-filters').style.display = 'none';
         updateVisibility();
     }
@@ -940,6 +1154,56 @@ def inject_ui(map_html, sidebar_html):
     function focusHotspot(lat, lon) {
         var map = getMap();
         if (map) map.setView([lat, lon], 17, { animate: true, duration: 1.0 });
+    }
+
+    // ── Toggle history panel inside popup ─────────────────────────────
+    function toggleHistory(id, btn) {
+        var el = document.getElementById(id);
+        if (!el) return;
+        var open = el.style.display === 'none' || el.style.display === '';
+        el.style.display = open ? 'block' : 'none';
+        btn.classList.toggle('open', open);
+        btn.textContent = (open ? '▼ Hide history' : '▶ Show full history') +
+            btn.textContent.replace(/[▼▶] (Hide|Show full) history/, '').trim();
+        // Re-extract report count from original text
+        var m = btn.textContent.match(/[(](\\d+) reports[)]/);
+        var cnt = m ? ' (' + m[1] + ' reports)' : '';
+        btn.textContent = (open ? '▼ Hide history' : '▶ Show full history') + cnt;
+    }
+
+    // ── Failed-fixes-only toggle ───────────────────────────────────────
+    var _failedFixesOnly = false;
+
+    function toggleFailedFixes() {
+        _failedFixesOnly = !_failedFixesOnly;
+        var btn = document.getElementById('failed-fixes-toggle');
+        if (btn) {
+            btn.classList.toggle('active', _failedFixesOnly);
+            btn.textContent = _failedFixesOnly ? '⚠️ Failed fixes (on)' : '⚠️ Failed fixes only';
+        }
+        updateVisibility();
+    }
+
+    // Patch updateVisibility to respect failed-fixes filter
+    var _origUpdateVisibility = null;
+    function updateVisibility() {
+        _markers.forEach(function(m) {
+            var catMatch = _activeFilters.size === 0 || _activeFilters.has(m.cat);
+            var failedMatch = !_failedFixesOnly || m.failed > 0;
+            var show = catMatch && failedMatch;
+            if (show) {
+                if (!m.map.hasLayer(m.marker)) m.marker.addTo(m.map);
+            } else {
+                if (m.map.hasLayer(m.marker)) m.map.removeLayer(m.marker);
+            }
+        });
+        document.querySelectorAll('.hotspot-row').forEach(function(row) {
+            var cat = row.getAttribute('data-cat');
+            var failed = parseInt(row.getAttribute('data-failed') || '0');
+            var catMatch = _activeFilters.size === 0 || _activeFilters.has(cat);
+            var failedMatch = !_failedFixesOnly || failed > 0;
+            row.style.display = (catMatch && failedMatch) ? '' : 'none';
+        });
     }
 
     // ── Init ───────────────────────────────────────────────────────────

@@ -1,0 +1,31 @@
+# Environment
+.env
+*.env
+
+# Generated data (can be large, regenerate with scripts)
+data/
+output/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+.venv/
+venv/
+env/
+
+# VSCode
+.vscode/
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter (if you explore data in notebooks)
+.ipynb_checkpoints/
+*.ipynb
